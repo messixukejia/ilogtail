@@ -1,0 +1,20 @@
+{
+    "inputs":
+    [
+      {
+        "detail": {
+            "Format": "otlpmetric",
+            "Address": "http://127.0.0.1:12345/v1/metrics"
+        },
+        "type": "service_http_server"
+      }
+    ],
+    "flushers" : [
+      {
+        "type" : "flusher_stdout",
+        "detail" : {
+          "OnlyStdout": true
+        }
+      }
+    ]
+  }

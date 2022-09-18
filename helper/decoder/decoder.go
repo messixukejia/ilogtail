@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/alibaba/ilogtail/helper/decoder/influxdb"
+	"github.com/alibaba/ilogtail/helper/decoder/opentelemetry"
 	"github.com/alibaba/ilogtail/helper/decoder/prometheus"
 	"github.com/alibaba/ilogtail/helper/decoder/sls"
 	"github.com/alibaba/ilogtail/pkg/protocol"
@@ -43,6 +44,8 @@ func GetDecoder(format string) (Decoder, error) {
 		return &prometheus.Decoder{}, nil
 	case "influx", "influxdb":
 		return &influxdb.Decoder{}, nil
+	case "otlpmetric":
+		return &opentelemetry.Decoder{}, nil
 	}
 	return nil, errDecoderNotFound
 }
