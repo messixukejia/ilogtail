@@ -15,7 +15,6 @@
 package opentelemetry
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/alibaba/ilogtail/helper/decoder/common"
@@ -29,9 +28,39 @@ type Decoder struct {
 
 // Decode impl
 func (d *Decoder) Decode(data []byte, req *http.Request) (logs []*protocol.Log, err error) {
-	otlp_req := pmetricotlp.NewRequest()
-	err = otlp_req.UnmarshalJSON(data)
-	fmt.Println(string(data))
+	switch req.Header.Get("Content-Type") {
+	case "application/x-protobuf":
+		otlp_req := pmetricotlp.NewRequest()
+		err = otlp_req.UnmarshalProto(data)
+
+		rms := otlp_req.Metrics().ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			buf.logEntry("ResourceMetrics #%d", i)
+			rm := rms.At(i)
+			buf.logEntry("Resource SchemaURL: %s", rm.SchemaUrl())
+			buf.logAttributes("Resource attributes", rm.Resource().Attributes())
+			ilms := rm.ScopeMetrics()
+			for j := 0; j < ilms.Len(); j++ {
+				buf.logEntry("ScopeMetrics #%d", j)
+				ilm := ilms.At(j)
+				buf.logEntry("ScopeMetrics SchemaURL: %s", ilm.SchemaUrl())
+				buf.logInstrumentationScope(ilm.Scope())
+				metrics := ilm.Metrics()
+				for k := 0; k < metrics.Len(); k++ {
+					buf.logEntry("Metric #%d", k)
+					metric := metrics.At(k)
+					buf.logMetricDescriptor(metric)
+					buf.logMetricDataPoints(metric)
+				}
+			}
+		}
+
+	case "application/json":
+		otlp_req := pmetricotlp.NewRequest()
+		err = otlp_req.UnmarshalJSON(data)
+	default:
+
+	}
 
 	return logs, err
 }
