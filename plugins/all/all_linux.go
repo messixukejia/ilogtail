@@ -19,6 +19,7 @@ package all
 
 import (
 	_ "github.com/alibaba/ilogtail/plugins/flusher/sls"
+	_ "github.com/alibaba/ilogtail/plugins/input/auditd"
 	_ "github.com/alibaba/ilogtail/plugins/input/docker/logmeta"
 	_ "github.com/alibaba/ilogtail/plugins/input/gpu"
 	_ "github.com/alibaba/ilogtail/plugins/input/journal"
