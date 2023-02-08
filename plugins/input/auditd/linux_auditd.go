@@ -17,7 +17,6 @@ package auditd
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -33,19 +32,30 @@ import (
 const (
 	v1 = iota
 	v2
+)
 
+const (
 	namespace = "auditd"
-
-	auditLocked = 2
 
 	unicast   = "unicast"
 	multicast = "multicast"
 	uidUnset  = "unset"
 
-	lostEventsUpdateInterval        = time.Second * 15
+	lostEventsUpdateInterval = time.Second * 15
+
+	auditLocked = 2
+
 	maxDefaultStreamBufferConsumers = 4
 
 	setPIDMaxRetries = 5
+)
+
+type backpressureStrategy uint8
+
+const (
+	bsKernel backpressureStrategy = 1 << iota
+	bsUserSpace
+	bsAuto
 )
 
 // ServiceLinuxAuditd struct implement the ServiceInput interface.
@@ -64,8 +74,10 @@ type ServiceLinuxAuditd struct {
 	BackpressureStrategy  string // The strategy used to mitigate backpressure. One of "user-space", "kernel", "both", "none", "auto" (default)
 	StreamBufferConsumers int
 
-	auditRules []auditRule
-	client     *libaudit.AuditClient
+	auditRules           []auditRule
+	client               *libaudit.AuditClient
+	supportMulticast     bool
+	backpressureStrategy backpressureStrategy
 
 	context pipeline.Context
 }
@@ -116,10 +128,17 @@ func (s *nonBlockingStream) EventsLost(count int) {
 }
 
 func (s *ServiceLinuxAuditd) Init(context pipeline.Context) (int, error) {
-	s.context = context
+	var err error
 
-	_, _, kernel, _ := kernelVersion()
-	logger.Infof(s.context.GetRuntimeContext(), "auditd module is running as euid=%v on kernel=%v", os.Geteuid(), kernel)
+	s.context = context
+	s.supportMulticast = s.isSupportMulticast()
+	s.backpressureStrategy = getBackpressureStrategy(s.BackpressureStrategy)
+
+	s.SocketType, err = s.getSocketType()
+	if err != nil {
+		return 0, err
+	}
+	logger.Info(s.context.GetRuntimeContext(), "socket_type=%s will be used.", s.SocketType)
 
 	return 0, nil
 }
@@ -133,7 +152,7 @@ func (s *ServiceLinuxAuditd) Start(collector pipeline.Collector) error {
 	logger.Info(s.context.GetRuntimeContext(), "start the ServiceAuditd plugin")
 
 	var err error
-	s.client, err = newAuditClient()
+	s.client, err = newAuditClient(s.SocketType)
 	if err != nil {
 		return fmt.Errorf("failed to create audit client: %w", err)
 	}
@@ -144,40 +163,22 @@ func (s *ServiceLinuxAuditd) Start(collector pipeline.Collector) error {
 	}
 
 	if status.Enabled == auditLocked {
-
+		logger.Error(s.context.GetRuntimeContext(), "Skipping rule configuration: Audit rules are locked")
+	} else if err := s.addRules(); err != nil {
+		logger.Errorf(s.context.GetRuntimeContext(), "Failure adding audit rules", "error", err)
+		return err
 	}
 
-	status, err = s.client.GetStatus()
+	err = s.initAuditClient()
 	if err != nil {
-		return fmt.Errorf("failed to get audit status: %w", err)
+		return fmt.Errorf("failed to init audit client: %w", err)
 	}
-	log.Printf("received audit status=%+v", status)
 
-	if status.Enabled == 0 {
-		log.Println("enabling auditing in the kernel")
-		if err = s.client.SetEnabled(true, libaudit.WaitForReply); err != nil {
-			return fmt.Errorf("failed to set enabled=true: %w", err)
+	if s.Immutable && status.Enabled != auditLocked {
+		if err := s.client.SetImmutable(libaudit.WaitForReply); err != nil {
+			logger.Errorf(s.context.GetRuntimeContext(), "Failure setting audit config as immutable", "error", err)
+			return fmt.Errorf("failed to set audit as immutable: %w", err)
 		}
-	}
-
-	if err = s.client.SetRateLimit(uint32(0), libaudit.NoWait); err != nil {
-		return fmt.Errorf("failed to set rate limit to unlimited: %w", err)
-	}
-
-	if err = s.client.SetBacklogLimit(uint32(8192), libaudit.NoWait); err != nil {
-		return fmt.Errorf("failed to set backlog limit: %w", err)
-	}
-
-	// if status.Enabled != 2 && *immutable {
-	// 	log.Printf("setting kernel settings as immutable")
-	// 	if err = client.SetImmutable(libaudit.NoWait); err != nil {
-	// 		return fmt.Errorf("failed to set kernel as immutable: %w", err)
-	// 	}
-	// }
-
-	log.Printf("sending message to kernel registering our PID (%v) as the audit daemon", os.Getpid())
-	if err = s.client.SetPID(libaudit.NoWait); err != nil {
-		return fmt.Errorf("failed to set audit PID: %w", err)
 	}
 
 	for {
@@ -186,9 +187,7 @@ func (s *ServiceLinuxAuditd) Start(collector pipeline.Collector) error {
 			return fmt.Errorf("receive failed: %w", err)
 		}
 
-		// Messages from 1300-2999 are valid audit messages.
-		if rawEvent.Type < auparse.AUDIT_USER_AUTH ||
-			rawEvent.Type > auparse.AUDIT_LAST_USER_MSG2 {
+		if filterRecordType(rawEvent.Type) {
 			continue
 		}
 
@@ -251,14 +250,15 @@ func (s *ServiceLinuxAuditd) receiveEvents() (<-chan []*auparse.AuditMessage, er
 	out := make(chan []*auparse.AuditMessage, 8192)
 
 	var st libaudit.Stream = &stream{nil, out}
-	// if ms.backpressureStrategy&bsUserSpace != 0 {
-	// 	// "user-space" backpressure mitigation strategy
-	// 	//
-	// 	// Consume events from our side as fast as possible, by dropping events
-	// 	// if the publishing pipeline would block.
-	// 	ms.log.Info("Using non-blocking stream to prevent backpressure propagating to the kernel.")
-	// 	st = &nonBlockingStream{done, out}
-	// }
+	if s.backpressureStrategy&bsUserSpace != 0 {
+		// "user-space" backpressure mitigation strategy
+		//
+		// Consume events from our side as fast as possible, by dropping events
+		// if the publishing pipeline would block.
+		logger.Info(s.context.GetRuntimeContext(),
+			"Using non-blocking stream to prevent backpressure propagating to the kernel.")
+		st = &nonBlockingStream{nil, out}
+	}
 	reassembler, err := libaudit.NewReassembler(int(50), 2*time.Second, st)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Reassembler: %w", err)
@@ -296,6 +296,208 @@ func (s *ServiceLinuxAuditd) receiveEvents() (<-chan []*auparse.AuditMessage, er
 	return out, nil
 }
 
+// multicast can only be used in kernel version >= 3.16.
+func (s *ServiceLinuxAuditd) isSupportMulticast() bool {
+	major, minor, kernel, err := kernelVersion()
+	if err != nil {
+		logger.Infof(s.context.GetRuntimeContext(), "auditd module is running as euid=%v on kernel=%v", os.Geteuid(), kernel)
+
+		if major > 3 || major == 3 && minor >= 16 {
+			return true
+		} else {
+			return false
+		}
+	}
+	return false
+}
+
+func (s *ServiceLinuxAuditd) getSocketType() (string, error) {
+	client, err := libaudit.NewAuditClient(nil)
+	if err != nil {
+		if s.SocketType == "" {
+			return "", fmt.Errorf("failed to create audit client: %w", err)
+		}
+		// Ignore errors if a socket type has been specified. It will fail during
+		// further setup and its necessary for unit tests to pass
+		return s.SocketType, nil
+	}
+	defer client.Close()
+	status, err := client.GetStatus()
+	if err != nil {
+		if s.SocketType == "" {
+			return "", fmt.Errorf("failed to get audit status: %w", err)
+		}
+		return s.SocketType, nil
+	}
+
+	isLocked := (status.Enabled == auditLocked)
+	hasRules := len(s.auditRules) > 0
+
+	const useAutodetect = "Remove the socket_type option to have auditbeat " +
+		"select the most suitable subscription method."
+	switch s.SocketType {
+	case unicast:
+		if isLocked && !s.Immutable {
+			logger.Errorf(s.context.GetRuntimeContext(), "requested unicast socket_type is not available "+
+				"because audit configuration is locked in the kernel "+
+				"(enabled=2). %s", useAutodetect)
+			return "", errors.New("unicast socket_type not available")
+		}
+		return s.SocketType, nil
+
+	case multicast:
+		if s.supportMulticast {
+			if hasRules {
+				logger.Warning(s.context.GetRuntimeContext(), "The audit rules specified in the configuration "+
+					"cannot be applied when using a multicast socket_type.")
+			}
+			return s.SocketType, nil
+		}
+		logger.Error(s.context.GetRuntimeContext(), "socket_type is set to multicast but based on the "+
+			"kernel version, multicast audit subscriptions are not supported. %s", useAutodetect)
+		return "", errors.New("multicast is not supported for current kernel")
+
+	default:
+		// attempt to determine the optimal socket_type
+		if s.supportMulticast {
+			if hasRules {
+				if isLocked && !s.Immutable {
+					logger.Warning(s.context.GetRuntimeContext(), "Audit rules specified in the configuration "+
+						"cannot be applied because the audit rules have been locked "+
+						"in the kernel (enabled=2). A multicast audit subscription "+
+						"will be used instead, which does not support setting rules")
+					return multicast, nil
+				}
+				return unicast, nil
+			}
+			return multicast, nil
+		}
+		if isLocked && !s.Immutable {
+			logger.Error(s.context.GetRuntimeContext(), "Cannot continue: audit configuration is locked "+
+				"in the kernel (enabled=2) which prevents using unicast "+
+				"sockets. Multicast audit subscriptions are not available "+
+				"in this kernel. Disable locking the audit configuration "+
+				"to use auditbeat.")
+			return "", errors.New("no connection to audit available")
+		}
+		return unicast, nil
+	}
+}
+
+func (s *ServiceLinuxAuditd) initAuditClient() error {
+	if s.SocketType == "multicast" {
+		// This request will fail with EPERM if this process does not have
+		// CAP_AUDIT_CONTROL, but we will ignore the response. The user will be
+		// required to ensure that auditing is enabled if the process is only
+		// given CAP_AUDIT_READ.
+		err := s.client.SetEnabled(true, libaudit.NoWait)
+		if err != nil {
+			return fmt.Errorf("failed to enable auditing in the kernel: %w", err)
+		}
+		return nil
+	}
+
+	// Unicast client initialization (requires CAP_AUDIT_CONTROL and that the
+	// process be in initial PID namespace).
+	status, err := s.client.GetStatus()
+	if err != nil {
+		return fmt.Errorf("failed to get audit status: %w", err)
+	}
+
+	logger.Infof(s.context.GetRuntimeContext(), "audit status from kernel at start", "audit_status", status)
+
+	if status.Enabled == auditLocked {
+		if !s.Immutable {
+			return errors.New("failed to configure: The audit system is locked")
+		}
+	}
+
+	if status.Enabled != auditLocked {
+		if fm, _ := failureMode(s.FailureMode); status.Failure != fm {
+			if err = s.client.SetFailure(libaudit.FailureMode(fm), libaudit.NoWait); err != nil {
+				return fmt.Errorf("failed to set audit failure mode in kernel: %w", err)
+			}
+		}
+
+		if status.BacklogLimit != s.BacklogLimit {
+			if err = s.client.SetBacklogLimit(s.BacklogLimit, libaudit.NoWait); err != nil {
+				return fmt.Errorf("failed to set audit backlog limit in kernel: %w", err)
+			}
+		}
+
+		if s.backpressureStrategy&(bsKernel|bsAuto) != 0 {
+			// "kernel" backpressure mitigation strategy
+			//
+			// configure the kernel to drop audit events immediately if the
+			// backlog queue is full.
+			if status.FeatureBitmap&libaudit.AuditFeatureBitmapBacklogWaitTime != 0 {
+				logger.Infof(s.context.GetRuntimeContext(),
+					"Setting kernel backlog wait time to prevent backpressure propagating to the kernel.")
+				if err = s.client.SetBacklogWaitTime(0, libaudit.NoWait); err != nil {
+					return fmt.Errorf("failed to set audit backlog wait time in kernel: %w", err)
+				}
+			} else {
+				if s.backpressureStrategy == bsAuto {
+					logger.Warning(s.context.GetRuntimeContext(),
+						"setting backlog wait time is not supported in this kernel. Enabling workaround.")
+					s.backpressureStrategy |= bsUserSpace
+				} else {
+					return errors.New("kernel backlog wait time not supported by kernel, but required by backpressure_strategy")
+				}
+			}
+		}
+
+		if s.backpressureStrategy&(bsKernel|bsUserSpace) == bsUserSpace && s.RateLimit == 0 {
+			// force a rate limit if the user-space strategy will be used without
+			// corresponding backlog_wait_time setting in the kernel
+			s.RateLimit = 5000
+		}
+
+		if status.RateLimit != s.RateLimit {
+			if err = s.client.SetRateLimit(s.RateLimit, libaudit.NoWait); err != nil {
+				return fmt.Errorf("failed to set audit rate limit in kernel: %w", err)
+			}
+		}
+
+		if status.Enabled == 0 {
+			if err = s.client.SetEnabled(true, libaudit.NoWait); err != nil {
+				return fmt.Errorf("failed to enable auditing in the kernel: %w", err)
+			}
+		}
+	}
+
+	if err := s.client.WaitForPendingACKs(); err != nil {
+		return fmt.Errorf("failed to wait for ACKs: %w", err)
+	}
+
+	if err := s.setRecvPID(setPIDMaxRetries); err != nil {
+		var errno syscall.Errno
+		if ok := errors.As(err, &errno); ok && errno == syscall.EEXIST && status.PID != 0 {
+			return fmt.Errorf("failed to set audit PID. An audit process is already running (PID %d)", status.PID)
+		}
+		return fmt.Errorf("failed to set audit PID (current audit PID %d): %w", status.PID, err)
+	}
+	return nil
+}
+
+func (s *ServiceLinuxAuditd) setRecvPID(retries int) (err error) {
+	if err = s.client.SetPID(libaudit.WaitForReply); err == nil || !errors.Is(err, syscall.ENOBUFS) || retries == 0 {
+		return err
+	}
+	// At this point the netlink channel is congested (ENOBUFS).
+	// Drain and close the client, then retry with a new client.
+	closeAuditClient(s.client)
+	if s.client, err = newAuditClient(s.SocketType); err != nil {
+		return fmt.Errorf("failed to recover from ENOBUFS: %w", err)
+	}
+	logger.Info(s.context.GetRuntimeContext(), "Recovering from ENOBUFS ...")
+	return s.setRecvPID(retries - 1)
+}
+
+func (s *ServiceLinuxAuditd) addRules() error {
+	return nil
+}
+
 func kernelVersion() (major, minor int, full string, err error) {
 	var uname syscall.Utsname
 	if err := syscall.Uname(&uname); err != nil {
@@ -331,7 +533,53 @@ func kernelVersion() (major, minor int, full string, err error) {
 	return major, minor, release, nil
 }
 
-func newAuditClient() (*libaudit.AuditClient, error) {
+func failureMode(mode string) (uint32, error) {
+	switch strings.ToLower(mode) {
+	case "silent":
+		return 0, nil
+	case "log":
+		return 1, nil
+	case "panic":
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("invalid failure_mode '%v' (use silent, log, or panic)", mode)
+	}
+}
+
+func getBackpressureStrategy(value string) backpressureStrategy {
+	switch value {
+	case "auto":
+		return bsAuto
+	case "kernel":
+		return bsKernel
+	case "userspace":
+		return bsUserSpace
+	case "both":
+		return bsKernel | bsUserSpace
+	default:
+		return 0
+	}
+}
+
+func filterRecordType(typ auparse.AuditMessageType) bool {
+	switch {
+	// REPLACE messages are tests to check if Auditbeat is still healthy by
+	// seeing if unicast messages can be sent without error from the kernel.
+	// Ignore them.
+	case typ == auparse.AUDIT_REPLACE:
+		return true
+	// Messages from 1300-2999 are valid audit message types.
+	case (typ < auparse.AUDIT_USER_AUTH || typ > auparse.AUDIT_LAST_USER_MSG2) && typ != auparse.AUDIT_LOGIN:
+		return true
+	}
+
+	return false
+}
+
+func newAuditClient(sockType string) (*libaudit.AuditClient, error) {
+	if sockType == multicast {
+		return libaudit.NewMulticastAuditClient(nil)
+	}
 	return libaudit.NewAuditClient(nil)
 }
 
