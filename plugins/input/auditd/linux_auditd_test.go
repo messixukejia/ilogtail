@@ -18,6 +18,7 @@
 package auditd
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func (c *mockCollector) AddDataArrayWithContext(
 }
 
 func (c *mockCollector) AddRawLogWithContext(log *protocol.Log, ctx map[string]interface{}) {
-
+	fmt.Print(log.String() + "\n")
 }
 func TestLinuxAuditInit(t *testing.T) {
 	service_auditd := &ServiceLinuxAuditd{}
@@ -66,6 +67,6 @@ func TestLinuxAuditInit(t *testing.T) {
 	collector := &mockCollector{}
 	service_auditd.Init(ctx)
 	service_auditd.Start(collector)
-	time.Sleep(10 * time.Second)
+	time.Sleep(20 * time.Second)
 	service_auditd.Stop()
 }

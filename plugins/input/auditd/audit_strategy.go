@@ -28,7 +28,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alibaba/ilogtail/pkg/util"
 	"github.com/elastic/go-libaudit/v2"
+	"github.com/elastic/go-libaudit/v2/aucoalesce"
 	"github.com/elastic/go-libaudit/v2/auparse"
 )
 
@@ -108,6 +110,206 @@ func filterRecordType(typ auparse.AuditMessageType) bool {
 	}
 
 	return false
+}
+
+func addUser(u aucoalesce.User) string {
+	user := make(map[string]string)
+	for id, value := range u.IDs {
+		if value == uidUnset {
+			continue
+		}
+		switch id {
+		case "uid":
+			user["id"] = value
+		case "gid":
+			user["group.id"] = value
+		case "euid":
+			user["effective.id"] = value
+		case "egid":
+			user["effective.group.id"] = value
+		case "suid":
+			user["saved.id"] = value
+		case "sgid":
+			user["saved.group.id"] = value
+		case "fsuid":
+			user["filesystem.id"] = value
+		case "fsgid":
+			user["filesystem.group.id"] = value
+		case "auid":
+			user["audit.id"] = value
+		default:
+			user[id+".id"] = value
+		}
+
+		if len(u.SELinux) > 0 {
+			user["selinux"] = util.InterfaceToJSONStringIgnoreErr(u.SELinux)
+		}
+	}
+
+	for id, value := range u.Names {
+		switch id {
+		case "uid":
+			user["name"] = value
+		case "gid":
+			user["group.name"] = value
+		case "euid":
+			user["effective.name"] = value
+		case "egid":
+			user["effective.group.name"] = value
+		case "suid":
+			user["saved.name"] = value
+		case "sgid":
+			user["saved.group.name"] = value
+		case "fsuid":
+			user["filesystem.name"] = value
+		case "fsgid":
+			user["filesystem.group.name"] = value
+		case "auid":
+			user["audit.name"] = value
+		default:
+			user[id+".name"] = value
+		}
+	}
+	return util.InterfaceToJSONStringIgnoreErr(user)
+}
+
+func addProcess(p aucoalesce.Process) string {
+	if p.IsEmpty() {
+		return ""
+	}
+
+	process := make(map[string]string)
+
+	if p.PID != "" {
+		process["pid"] = p.PID
+	}
+	if p.PPID != "" {
+		process["ppid"] = p.PPID
+	}
+	if p.Title != "" {
+		process["title"] = p.Title
+	}
+	if p.Name != "" {
+		process["name"] = p.Name
+	}
+	if p.Exe != "" {
+		process["executable"] = p.Exe
+	}
+	if p.CWD != "" {
+		process["working_directory"] = p.CWD
+	}
+	if len(p.Args) > 0 {
+		process["args"] = util.InterfaceToJSONStringIgnoreErr(p.Args)
+	}
+
+	return util.InterfaceToJSONStringIgnoreErr(process)
+}
+
+func addFile(f *aucoalesce.File) string {
+	if f == nil {
+		return ""
+	}
+
+	file := make(map[string]string)
+	if f.Path != "" {
+		file["path"] = f.Path
+	}
+	if f.Device != "" {
+		file["device"] = f.Device
+	}
+	if f.Inode != "" {
+		file["inode"] = f.Inode
+	}
+	if f.Mode != "" {
+		file["mode"] = f.Mode
+	}
+	if f.UID != "" {
+		file["uid"] = f.UID
+	}
+	if f.GID != "" {
+		file["gid"] = f.GID
+	}
+	if f.Owner != "" {
+		file["owner"] = f.Owner
+	}
+	if f.Group != "" {
+		file["group"] = f.Group
+	}
+	if len(f.SELinux) > 0 {
+		file["selinux"] = util.InterfaceToJSONStringIgnoreErr(f.SELinux)
+	}
+	return util.InterfaceToJSONStringIgnoreErr(file)
+}
+
+func addAddress(addr *aucoalesce.Address) string {
+	if addr == nil {
+		return ""
+	}
+	address := make(map[string]string)
+	if addr.Hostname != "" {
+		address["domain"] = addr.Hostname
+	}
+	if addr.IP != "" {
+		address["ip"] = addr.IP
+	}
+	if addr.Port != "" {
+		address["port"] = addr.Port
+	}
+	if addr.Path != "" {
+		address["path"] = addr.Path
+	}
+
+	return util.InterfaceToJSONStringIgnoreErr(addr)
+}
+
+func addNetwork(net *aucoalesce.Network) string {
+	if net == nil {
+		return ""
+	}
+	network := make(map[string]string)
+	network["direction"] = string(net.Direction)
+
+	return util.InterfaceToJSONStringIgnoreErr(network)
+}
+
+func addSummary(s aucoalesce.Summary) string {
+	summary := make(map[string]string)
+
+	if s.Actor.Primary != "" {
+		summary["actor.primary"] = s.Actor.Primary
+	}
+	if s.Actor.Secondary != "" {
+		summary["actor.secondary"] = s.Actor.Secondary
+	}
+	if s.Object.Primary != "" {
+		summary["object.primary"] = s.Object.Primary
+	}
+	if s.Object.Secondary != "" {
+		summary["object.secondary"] = s.Object.Secondary
+	}
+	if s.Object.Type != "" {
+		summary["object.type"] = s.Object.Type
+	}
+	if s.How != "" {
+		summary["how"] = s.How
+	}
+
+	return util.InterfaceToJSONStringIgnoreErr(summary)
+}
+
+func normalizeEventFields(event *aucoalesce.Event) string {
+	info := make(map[string]string)
+
+	if len(event.ECS.Event.Category) > 0 {
+		info["category"] = util.InterfaceToJSONStringIgnoreErr(event.ECS.Event.Category)
+	}
+	if len(event.ECS.Event.Type) > 0 {
+		info["type"] = util.InterfaceToJSONStringIgnoreErr(event.ECS.Event.Type)
+	}
+	if event.ECS.Event.Outcome != "" {
+		info["outcome"] = event.ECS.Event.Outcome // ToDo
+	}
+	return util.InterfaceToJSONStringIgnoreErr(info)
 }
 
 func newAuditClient(sockType string) (*libaudit.AuditClient, error) {

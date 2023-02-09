@@ -18,6 +18,7 @@
 package auditd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -26,7 +27,10 @@ import (
 
 	"github.com/alibaba/ilogtail/pkg/logger"
 	"github.com/alibaba/ilogtail/pkg/pipeline"
+	"github.com/alibaba/ilogtail/pkg/protocol"
+	"github.com/alibaba/ilogtail/pkg/util"
 	"github.com/elastic/go-libaudit/v2"
+	"github.com/elastic/go-libaudit/v2/aucoalesce"
 	"github.com/elastic/go-libaudit/v2/auparse"
 )
 
@@ -80,7 +84,9 @@ type ServiceLinuxAuditd struct {
 	supportMulticast     bool
 	backpressureStrategy backpressureStrategy
 
-	context pipeline.Context
+	context   pipeline.Context
+	collector pipeline.Collector
+	version   int8
 }
 
 type auditRule struct {
@@ -93,16 +99,14 @@ type auditRule struct {
 // stream receives callbacks from the libaudit.Reassembler for completed events
 // or lost events that are detected by gaps in sequence numbers.
 type stream struct {
-	done <-chan struct{}
-	out  chan<- []*auparse.AuditMessage
+	collector  pipeline.Collector
+	resolveIDs bool
 }
 
 func (s *stream) ReassemblyComplete(msgs []*auparse.AuditMessage) {
-	select {
-	case <-s.done:
-		return
-	case s.out <- msgs:
-	}
+	l, _ := converterAuditEventToSLSLog(msgs, s.resolveIDs)
+
+	s.collector.AddRawLog(l)
 }
 
 func (s *stream) EventsLost(count int) {
@@ -115,13 +119,9 @@ func (s *stream) EventsLost(count int) {
 type nonBlockingStream stream
 
 func (s *nonBlockingStream) ReassemblyComplete(msgs []*auparse.AuditMessage) {
-	select {
-	case <-s.done:
-		return
-	case s.out <- msgs:
-	default:
-
-	}
+	event, _ := aucoalesce.CoalesceMessages(msgs)
+	jsonBytes, _ := json.Marshal(event)
+	fmt.Print(string(jsonBytes) + "\n")
 }
 
 func (s *nonBlockingStream) EventsLost(count int) {
@@ -151,6 +151,9 @@ func (s *ServiceLinuxAuditd) Description() string {
 // Start the service example plugin would run in a separate go routine, so it is blocking method.
 func (s *ServiceLinuxAuditd) Start(collector pipeline.Collector) error {
 	logger.Info(s.context.GetRuntimeContext(), "start the ServiceAuditd plugin")
+
+	s.collector = collector
+	s.version = v1
 
 	var err error
 	s.client, err = newAuditClient(s.SocketType)
@@ -182,23 +185,10 @@ func (s *ServiceLinuxAuditd) Start(collector pipeline.Collector) error {
 		}
 	}
 
-	for {
-		rawEvent, err := s.client.Receive(false)
-		if err != nil {
-			return fmt.Errorf("receive failed: %w", err)
-		}
-
-		if filterRecordType(rawEvent.Type) {
-			continue
-		}
-
-		fmt.Printf("type=%v msg=%s\n", rawEvent.Type, rawEvent.Data)
+	err = s.receiveEvents()
+	if err != nil {
+		return err
 	}
-
-	// out, err := s.receiveEvents()
-	// if err != nil {
-	// 	return err
-	// }
 
 	// go func() {
 	// 	defer func() { // Close the most recently allocated "client" instance.
@@ -247,10 +237,8 @@ func (s *ServiceLinuxAuditd) Stop() error {
 	return err
 }
 
-func (s *ServiceLinuxAuditd) receiveEvents() (<-chan []*auparse.AuditMessage, error) {
-	out := make(chan []*auparse.AuditMessage, 8192)
-
-	var st libaudit.Stream = &stream{nil, out}
+func (s *ServiceLinuxAuditd) receiveEvents() error {
+	var st libaudit.Stream = &stream{s.collector, s.ResolveIDs}
 	if s.backpressureStrategy&bsUserSpace != 0 {
 		// "user-space" backpressure mitigation strategy
 		//
@@ -258,17 +246,16 @@ func (s *ServiceLinuxAuditd) receiveEvents() (<-chan []*auparse.AuditMessage, er
 		// if the publishing pipeline would block.
 		logger.Info(s.context.GetRuntimeContext(),
 			"Using non-blocking stream to prevent backpressure propagating to the kernel.")
-		st = &nonBlockingStream{nil, out}
+		st = &nonBlockingStream{s.collector, s.ResolveIDs}
 	}
 	reassembler, err := libaudit.NewReassembler(int(50), 2*time.Second, st)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Reassembler: %w", err)
+		return fmt.Errorf("failed to create Reassembler: %w", err)
 	}
 	//go maintain(done, reassembler)
 
 	go func() {
 		//defer ms.log.Debug("receiveEvents goroutine exited")
-		defer close(out)
 		defer reassembler.Close()
 
 		for {
@@ -281,9 +268,9 @@ func (s *ServiceLinuxAuditd) receiveEvents() (<-chan []*auparse.AuditMessage, er
 				continue
 			}
 
-			// if filterRecordType(raw.Type) {
-			// 	continue
-			// }
+			if filterRecordType(raw.Type) {
+				continue
+			}
 			if err := reassembler.Push(raw.Type, raw.Data); err != nil {
 				// ms.log.Debugw("Dropping audit message",
 				// 	"record_type", raw.Type,
@@ -294,7 +281,7 @@ func (s *ServiceLinuxAuditd) receiveEvents() (<-chan []*auparse.AuditMessage, er
 		}
 	}()
 
-	return out, nil
+	return nil
 }
 
 // multicast can only be used in kernel version >= 3.16.
@@ -497,6 +484,71 @@ func (s *ServiceLinuxAuditd) setRecvPID(retries int) (err error) {
 
 func (s *ServiceLinuxAuditd) addRules() error {
 	return nil
+}
+
+func converterAuditEventToSLSLog(msgs []*auparse.AuditMessage, resolveIDs bool) (*protocol.Log, error) {
+	auditEvent, err := aucoalesce.CoalesceMessages(msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	if resolveIDs {
+		aucoalesce.ResolveIDs(auditEvent)
+	}
+
+	eventResult := auditEvent.Result
+	if eventResult == "fail" {
+		eventResult = "failure"
+	}
+
+	contents := []*protocol.Log_Content{
+		{
+			Key:   "user",
+			Value: addUser(auditEvent.User),
+		},
+		{
+			Key:   "process",
+			Value: addProcess(auditEvent.Process),
+		},
+		{
+			Key:   "file",
+			Value: addFile(auditEvent.File),
+		},
+		{
+			Key:   "source",
+			Value: addAddress(auditEvent.Source),
+		},
+		{
+			Key:   "destination",
+			Value: addAddress(auditEvent.Dest),
+		},
+		{
+			Key:   "network",
+			Value: addNetwork(auditEvent.Net),
+		},
+		{
+			Key:   "tags",
+			Value: util.InterfaceToJSONStringIgnoreErr(auditEvent.Tags),
+		},
+		{
+			Key:   "summary",
+			Value: addSummary(auditEvent.Summary),
+		},
+		{
+			Key:   "paths",
+			Value: util.InterfaceToJSONStringIgnoreErr(auditEvent.Paths),
+		},
+		{
+			Key:   "event",
+			Value: normalizeEventFields(auditEvent),
+		},
+	}
+
+	r := &protocol.Log{
+		Time:     uint32(auditEvent.Timestamp.Unix()),
+		Contents: contents,
+	}
+	return r, err
 }
 
 // Register the plugin to the ServiceInputs array.
