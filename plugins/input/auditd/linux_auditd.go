@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,7 +40,6 @@ const (
 	v1 = iota
 	v2
 )
-
 const (
 	namespace = "auditd"
 
@@ -62,6 +63,18 @@ const (
 	bsUserSpace
 	bsAuto
 )
+
+type auditRule struct {
+	flags string
+	data  []byte
+}
+
+type ruleWithSource struct {
+	rule   auditRule
+	source string
+}
+
+type ruleSet map[string]ruleWithSource
 
 // ServiceLinuxAuditd struct implement the ServiceInput interface.
 type ServiceLinuxAuditd struct {
@@ -87,11 +100,6 @@ type ServiceLinuxAuditd struct {
 	context   pipeline.Context
 	collector pipeline.Collector
 	version   int8
-}
-
-type auditRule struct {
-	flags string
-	data  []byte
 }
 
 // stream type
@@ -135,8 +143,15 @@ func (s *ServiceLinuxAuditd) Init(context pipeline.Context) (int, error) {
 	s.supportMulticast = s.isSupportMulticast()
 	s.backpressureStrategy = getBackpressureStrategy(s.BackpressureStrategy)
 
-	s.SocketType, err = s.getSocketType()
+	s.SocketType, err = getSocketType(s)
 	if err != nil {
+		return 0, err
+	}
+	s.SocketType = strings.ToLower(s.SocketType)
+
+	err = s.validateConfig()
+	if err != nil {
+		logger.Errorf(s.context.GetRuntimeContext(), "failed to init ServiceLinuxAuditd:", "error", err)
 		return 0, err
 	}
 	logger.Info(s.context.GetRuntimeContext(), "socket_type=%s will be used.", s.SocketType)
@@ -237,6 +252,31 @@ func (s *ServiceLinuxAuditd) Stop() error {
 	return err
 }
 
+func (s *ServiceLinuxAuditd) validateConfig() error {
+	var err error
+	s.auditRules, err = loadRules(s.RulesBlob, s.RuleFiles)
+	if err != nil {
+		return err
+	}
+	_, err = failureMode(s.FailureMode)
+	if err != nil {
+		return err
+	}
+
+	switch s.SocketType {
+	case "multicast":
+		if s.Immutable {
+			return fmt.Errorf("immutable can't be used with socket_type: multicast")
+		}
+	case "", "unicast":
+	default:
+		return fmt.Errorf("invalid socket_type "+
+			"'%v' (use unicast, multicast, or don't set a value)", s.SocketType)
+	}
+
+	return nil
+}
+
 func (s *ServiceLinuxAuditd) receiveEvents() error {
 	var st libaudit.Stream = &stream{s.collector, s.ResolveIDs}
 	if s.backpressureStrategy&bsUserSpace != 0 {
@@ -297,79 +337,6 @@ func (s *ServiceLinuxAuditd) isSupportMulticast() bool {
 		}
 	}
 	return false
-}
-
-func (s *ServiceLinuxAuditd) getSocketType() (string, error) {
-	client, err := libaudit.NewAuditClient(nil)
-	if err != nil {
-		if s.SocketType == "" {
-			return "", fmt.Errorf("failed to create audit client: %w", err)
-		}
-		// Ignore errors if a socket type has been specified. It will fail during
-		// further setup and its necessary for unit tests to pass
-		return s.SocketType, nil
-	}
-	defer client.Close()
-	status, err := client.GetStatus()
-	if err != nil {
-		if s.SocketType == "" {
-			return "", fmt.Errorf("failed to get audit status: %w", err)
-		}
-		return s.SocketType, nil
-	}
-
-	isLocked := (status.Enabled == auditLocked)
-	hasRules := len(s.auditRules) > 0
-
-	const useAutodetect = "Remove the socket_type option to have auditbeat " +
-		"select the most suitable subscription method."
-	switch s.SocketType {
-	case unicast:
-		if isLocked && !s.Immutable {
-			logger.Errorf(s.context.GetRuntimeContext(), "requested unicast socket_type is not available "+
-				"because audit configuration is locked in the kernel "+
-				"(enabled=2). %s", useAutodetect)
-			return "", errors.New("unicast socket_type not available")
-		}
-		return s.SocketType, nil
-
-	case multicast:
-		if s.supportMulticast {
-			if hasRules {
-				logger.Warning(s.context.GetRuntimeContext(), "The audit rules specified in the configuration "+
-					"cannot be applied when using a multicast socket_type.")
-			}
-			return s.SocketType, nil
-		}
-		logger.Error(s.context.GetRuntimeContext(), "socket_type is set to multicast but based on the "+
-			"kernel version, multicast audit subscriptions are not supported. %s", useAutodetect)
-		return "", errors.New("multicast is not supported for current kernel")
-
-	default:
-		// attempt to determine the optimal socket_type
-		if s.supportMulticast {
-			if hasRules {
-				if isLocked && !s.Immutable {
-					logger.Warning(s.context.GetRuntimeContext(), "Audit rules specified in the configuration "+
-						"cannot be applied because the audit rules have been locked "+
-						"in the kernel (enabled=2). A multicast audit subscription "+
-						"will be used instead, which does not support setting rules")
-					return multicast, nil
-				}
-				return unicast, nil
-			}
-			return multicast, nil
-		}
-		if isLocked && !s.Immutable {
-			logger.Error(s.context.GetRuntimeContext(), "Cannot continue: audit configuration is locked "+
-				"in the kernel (enabled=2) which prevents using unicast "+
-				"sockets. Multicast audit subscriptions are not available "+
-				"in this kernel. Disable locking the audit configuration "+
-				"to use auditbeat.")
-			return "", errors.New("no connection to audit available")
-		}
-		return unicast, nil
-	}
 }
 
 func (s *ServiceLinuxAuditd) initAuditClient() error {
@@ -483,6 +450,43 @@ func (s *ServiceLinuxAuditd) setRecvPID(retries int) (err error) {
 }
 
 func (s *ServiceLinuxAuditd) addRules() error {
+	rules := s.auditRules
+
+	if len(rules) == 0 {
+		return nil
+	}
+
+	client, err := libaudit.NewAuditClient(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create audit client for adding rules: %w", err)
+	}
+	defer closeAuditClient(client)
+
+	// Delete existing rules.
+	n, err := client.DeleteRules()
+	if err != nil {
+		return fmt.Errorf("failed to delete existing rules: %w", err)
+	}
+	logger.Infof(s.context.GetRuntimeContext(), "Deleted %v pre-existing audit rules.", n)
+
+	// Add rule to ignore syscalls from this process
+	if rule, err := buildPIDIgnoreRule(os.Getpid()); err == nil {
+		rules = append([]auditRule{rule}, rules...)
+	} else {
+		logger.Errorf(s.context.GetRuntimeContext(), "Failed to build a rule to ignore self", "error", err)
+	}
+	// Add rules from config.
+	var failCount int
+	for _, rule := range rules {
+		if err = client.AddRule(rule.data); err != nil {
+			// Treat rule add errors as warnings and continue.
+			err = fmt.Errorf("failed to add audit rule '%v': %w", rule.flags, err)
+			logger.Warningf(s.context.GetRuntimeContext(), "Failure adding audit rule", "error", err)
+			failCount++
+		}
+	}
+	logger.Infof(s.context.GetRuntimeContext(), "Successfully added %d of %d audit rules.",
+		len(rules)-failCount, len(rules))
 	return nil
 }
 
@@ -496,12 +500,31 @@ func converterAuditEventToSLSLog(msgs []*auparse.AuditMessage, resolveIDs bool) 
 		aucoalesce.ResolveIDs(auditEvent)
 	}
 
-	eventResult := auditEvent.Result
-	if eventResult == "fail" {
-		eventResult = "failure"
-	}
-
 	contents := []*protocol.Log_Content{
+		{
+			Key:   "category",
+			Value: auditEvent.Category.String(),
+		},
+		{
+			Key:   "action",
+			Value: auditEvent.Summary.Action,
+		},
+		{
+			Key:   "message_type",
+			Value: strings.ToLower(auditEvent.Type.String()),
+		},
+		{
+			Key:   "sequence",
+			Value: strconv.FormatUint(uint64(auditEvent.Sequence), 10),
+		},
+		{
+			Key:   "result",
+			Value: auditEvent.Result,
+		},
+		{
+			Key:   "data",
+			Value: createAuditdData(auditEvent.Data),
+		},
 		{
 			Key:   "user",
 			Value: addUser(auditEvent.User),

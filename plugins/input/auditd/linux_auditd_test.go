@@ -23,7 +23,9 @@ import (
 	"time"
 
 	"github.com/alibaba/ilogtail/pkg/protocol"
+	"github.com/alibaba/ilogtail/pkg/util"
 	"github.com/alibaba/ilogtail/plugins/test/mock"
+	"github.com/stretchr/testify/assert"
 )
 
 type mockLog struct {
@@ -59,7 +61,12 @@ func (c *mockCollector) AddDataArrayWithContext(
 }
 
 func (c *mockCollector) AddRawLogWithContext(log *protocol.Log, ctx map[string]interface{}) {
-	fmt.Print(log.String() + "\n")
+	out := make(map[string]string)
+	for i := 0; i < len(log.Contents); i++ {
+		content := log.Contents[i]
+		out[content.Key] = content.Value
+	}
+	fmt.Print(util.InterfaceToJSONStringIgnoreErr(out) + "\n")
 }
 func TestLinuxAuditInit(t *testing.T) {
 	service_auditd := &ServiceLinuxAuditd{}
@@ -69,4 +76,16 @@ func TestLinuxAuditInit(t *testing.T) {
 	service_auditd.Start(collector)
 	time.Sleep(20 * time.Second)
 	service_auditd.Stop()
+}
+
+func TestLinuxAuditRules(t *testing.T) {
+	rulesBlob := ` 
+	# Comments and empty lines are ignored.
+	-w /etc/passwd -p wa -k auth
+	-a always,exit -S execve -k exec`
+
+	rules, err := loadRules(rulesBlob, nil)
+	if err == nil {
+		assert.Equal(t, 2, len(rules))
+	}
 }

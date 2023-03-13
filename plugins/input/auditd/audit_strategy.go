@@ -21,18 +21,101 @@
 package auditd
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/alibaba/ilogtail/pkg/logger"
 	"github.com/alibaba/ilogtail/pkg/util"
 	"github.com/elastic/go-libaudit/v2"
 	"github.com/elastic/go-libaudit/v2/aucoalesce"
 	"github.com/elastic/go-libaudit/v2/auparse"
+	"github.com/elastic/go-libaudit/v2/rule"
+	"github.com/elastic/go-libaudit/v2/rule/flags"
+	"github.com/joeshaw/multierror"
 )
+
+func getSocketType(s *ServiceLinuxAuditd) (string, error) {
+	client, err := libaudit.NewAuditClient(nil)
+	if err != nil {
+		if s.SocketType == "" {
+			return "", fmt.Errorf("failed to create audit client: %w", err)
+		}
+		// Ignore errors if a socket type has been specified. It will fail during
+		// further setup and its necessary for unit tests to pass
+		return s.SocketType, nil
+	}
+	defer client.Close()
+	status, err := client.GetStatus()
+	if err != nil {
+		if s.SocketType == "" {
+			return "", fmt.Errorf("failed to get audit status: %w", err)
+		}
+		return s.SocketType, nil
+	}
+
+	isLocked := (status.Enabled == auditLocked)
+	hasRules := len(s.auditRules) > 0
+
+	const useAutodetect = "Remove the socket_type option to have auditbeat " +
+		"select the most suitable subscription method."
+	switch s.SocketType {
+	case unicast:
+		if isLocked && !s.Immutable {
+			logger.Errorf(s.context.GetRuntimeContext(), "requested unicast socket_type is not available "+
+				"because audit configuration is locked in the kernel "+
+				"(enabled=2). %s", useAutodetect)
+			return "", errors.New("unicast socket_type not available")
+		}
+		return s.SocketType, nil
+
+	case multicast:
+		if s.supportMulticast {
+			if hasRules {
+				logger.Warning(s.context.GetRuntimeContext(), "The audit rules specified in the configuration "+
+					"cannot be applied when using a multicast socket_type.")
+			}
+			return s.SocketType, nil
+		}
+		logger.Error(s.context.GetRuntimeContext(), "socket_type is set to multicast but based on the "+
+			"kernel version, multicast audit subscriptions are not supported. %s", useAutodetect)
+		return "", errors.New("multicast is not supported for current kernel")
+
+	default:
+		// attempt to determine the optimal socket_type
+		if s.supportMulticast {
+			if hasRules {
+				if isLocked && !s.Immutable {
+					logger.Warning(s.context.GetRuntimeContext(), "Audit rules specified in the configuration "+
+						"cannot be applied because the audit rules have been locked "+
+						"in the kernel (enabled=2). A multicast audit subscription "+
+						"will be used instead, which does not support setting rules")
+					return multicast, nil
+				}
+				return unicast, nil
+			}
+			return multicast, nil
+		}
+		if isLocked && !s.Immutable {
+			logger.Error(s.context.GetRuntimeContext(), "Cannot continue: audit configuration is locked "+
+				"in the kernel (enabled=2) which prevents using unicast "+
+				"sockets. Multicast audit subscriptions are not available "+
+				"in this kernel. Disable locking the audit configuration "+
+				"to use auditbeat.")
+			return "", errors.New("no connection to audit available")
+		}
+		return unicast, nil
+	}
+}
 
 func kernelVersion() (major, minor int, full string, err error) {
 	var uname syscall.Utsname
@@ -110,6 +193,121 @@ func filterRecordType(typ auparse.AuditMessageType) bool {
 	}
 
 	return false
+}
+
+func loadRules(rulesBlob string, ruleFiles []string) (auditRules []auditRule, err error) {
+	var paths []string
+	for _, pattern := range ruleFiles {
+		absPattern, err := filepath.Abs(pattern)
+		if err != nil {
+			return auditRules, fmt.Errorf("unable to get the absolute path for %s: %w", pattern, err)
+		}
+		files, err := filepath.Glob(absPattern)
+		if err != nil {
+			return auditRules, err
+		}
+		sort.Strings(files)
+		paths = append(paths, files...)
+	}
+
+	knownRules := ruleSet{}
+
+	rules, err := readRules(bytes.NewBufferString(rulesBlob), "(rules blob config)", knownRules)
+	if err != nil {
+		return auditRules, err
+	}
+	auditRules = append(auditRules, rules...)
+
+	for _, filename := range paths {
+		fHandle, err := os.Open(filename)
+		if err != nil {
+			return auditRules, fmt.Errorf("unable to open rule file '%s': %w", filename, err)
+		}
+		rules, err = readRules(fHandle, filename, knownRules)
+		if err != nil {
+			return auditRules, err
+		}
+		auditRules = append(auditRules, rules...)
+	}
+
+	return auditRules, nil
+}
+
+func readRules(reader io.Reader, source string, knownRules ruleSet) (rules []auditRule, err error) {
+	var errs multierror.Errors
+
+	s := bufio.NewScanner(reader)
+	for lineNum := 1; s.Scan(); lineNum++ {
+		location := fmt.Sprintf("%s:%d", source, lineNum)
+		line := strings.TrimSpace(s.Text())
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+
+		// Parse the CLI flags into an intermediate rule specification.
+		r, err := flags.Parse(line)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("at %s: failed to parse rule '%v': %w", location, line, err))
+			continue
+		}
+
+		// Convert rule specification to a binary rule representation.
+		data, err := rule.Build(r)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("at %s: failed to interpret rule '%v': %w", location, line, err))
+			continue
+		}
+
+		// Detect duplicates based on the normalized binary rule representation.
+		existing, found := knownRules[string(data)]
+		if found {
+			errs = append(errs, fmt.Errorf("at %s: rule '%v' is a duplicate of '%v' at %s", location, line, existing.rule.flags, existing.source))
+			continue
+		}
+		rule := auditRule{flags: line, data: []byte(data)}
+		knownRules[string(data)] = ruleWithSource{rule, location}
+
+		rules = append(rules, rule)
+	}
+
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("failed loading rules: %w", errs.Err())
+	}
+	return rules, nil
+}
+
+func buildPIDIgnoreRule(pid int) (ruleData auditRule, err error) {
+	r := rule.SyscallRule{
+		Type:   rule.AppendSyscallRuleType,
+		List:   "exit",
+		Action: "never",
+		Filters: []rule.FilterSpec{
+			{
+				Type:       rule.ValueFilterType,
+				LHS:        "pid",
+				Comparator: "=",
+				RHS:        strconv.Itoa(pid),
+			},
+		},
+		Syscalls: []string{"all"},
+		Keys:     nil,
+	}
+	ruleData.flags = fmt.Sprintf("-A exit,never -F pid=%d -S all", pid)
+	ruleData.data, err = rule.Build(&r)
+	return ruleData, err
+}
+
+func createAuditdData(data map[string]string) string {
+	out := make(map[string]string)
+	for key, v := range data {
+		if strings.HasPrefix(key, "socket_") {
+			out["socket."+key[7:]] = v
+			continue
+		}
+
+		out[key] = v
+	}
+	return util.InterfaceToJSONStringIgnoreErr(out)
 }
 
 func addUser(u aucoalesce.User) string {
