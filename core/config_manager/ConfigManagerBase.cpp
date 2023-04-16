@@ -241,6 +241,9 @@ void ConfigManagerBase::MappingPluginConfig(const Json::Value& configValue, Conf
     if (configValue.isMember("docker_exclude_env") && configValue["docker_exclude_env"].isObject()) {
         detail["ExcludeEnv"] = configValue["docker_exclude_env"];
     }
+    if (configValue.isMember("advanced") && configValue["advanced"].isObject() && configValue["advanced"].isMember("collect_containers_flag")) {
+        detail["CollectContainersFlag"] = configValue["advanced"]["collect_containers_flag"];
+    }
     // parse k8s flags
     if (configValue.isMember("advanced") && configValue["advanced"].isObject()
         && configValue["advanced"].isMember("k8s") && configValue["advanced"]["k8s"].isObject()) {
@@ -2398,11 +2401,9 @@ bool ConfigManagerBase::GetYamlConfigDirUpdate() {
     std::vector<std::string> filepathes;
     std::unordered_map<std::string, int64_t> yamlConfigMTimeMap;
     static std::string localConfigDirPath = AppConfig::GetInstance()->GetLocalUserYamlConfigDirPath();
-    updateFlag |= CheckYamlDirConfigUpdate(localConfigDirPath, false, filepathes, yamlConfigMTimeMap);
-    // TODO: Change serverConfigDirPath to be parallel to localConfigDirPath. Futhermore, create serverConfigDirPath
-    // only when config server is connected.
-    // static std::string serverConfigDirPath = localConfigDirPath + "remote_config" + PATH_SEPARATOR;
-    // updateFlag |= CheckYamlDirConfigUpdate(serverConfigDirPath, true, filepathes, yamlConfigMTimeMap);
+    updateFlag |= CheckYamlDirConfigUpdate(localConfigDirPath, false, filepathes, yamlConfigMTimeMap, true);
+    static std::string serverConfigDirPath = AppConfig::GetInstance()->GetRemoteUserYamlConfigDirPath();
+    updateFlag |= CheckYamlDirConfigUpdate(serverConfigDirPath, true, filepathes, yamlConfigMTimeMap, false);
 
     if (mYamlConfigMTimeMap.size() != yamlConfigMTimeMap.size()) {
         updateFlag = true;
@@ -2439,7 +2440,8 @@ bool ConfigManagerBase::GetYamlConfigDirUpdate() {
 bool ConfigManagerBase::CheckYamlDirConfigUpdate(const std::string& configDirPath,
                                                  bool isRemote,
                                                  std::vector<std::string>& filepathes,
-                                                 std::unordered_map<std::string, int64_t>& yamlConfigMTimeMap) {
+                                                 std::unordered_map<std::string, int64_t>& yamlConfigMTimeMap,
+                                                 bool createIfNotExist) {
     bool updateFlag = false;
     fsutil::Dir configDir(configDirPath);
     if (!configDir.Open()) {
@@ -2447,7 +2449,7 @@ bool ConfigManagerBase::CheckYamlDirConfigUpdate(const std::string& configDirPat
         if (fsutil::Dir::IsEACCES(savedErrno) || fsutil::Dir::IsENOTDIR(savedErrno)
             || fsutil::Dir::IsENOENT(savedErrno)) {
             LOG_DEBUG(sLogger, ("invalid yaml conf dir", configDirPath)("error", ErrnoToString(savedErrno)));
-            if (!Mkdir(configDirPath.c_str())) {
+            if (createIfNotExist && !Mkdir(configDirPath.c_str())) {
                 savedErrno = errno;
                 if (!IsEEXIST(savedErrno)) {
                     LOG_ERROR(sLogger, ("create conf yaml dir failed", configDirPath)("error", strerror(savedErrno)));

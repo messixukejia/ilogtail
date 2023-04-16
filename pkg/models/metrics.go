@@ -14,6 +14,11 @@
 
 package models
 
+import (
+	"fmt"
+	"strings"
+)
+
 type MetricType int
 
 const (
@@ -84,7 +89,7 @@ func (v *MetricSingleValue) GetSingleValue() float64 {
 }
 
 func (v *MetricSingleValue) GetMultiValues() MetricFloatValues {
-	return noopFloatValues
+	return NilFloatValues
 }
 
 type MetricMultiValue struct {
@@ -111,7 +116,7 @@ func (v *MetricMultiValue) GetMultiValues() MetricFloatValues {
 	if v != nil && v.Values != nil {
 		return v.Values
 	}
-	return noopFloatValues
+	return NilFloatValues
 }
 
 type EmptyMetricValue struct {
@@ -130,7 +135,7 @@ func (v *EmptyMetricValue) GetSingleValue() float64 {
 }
 
 func (v *EmptyMetricValue) GetMultiValues() MetricFloatValues {
-	return noopFloatValues
+	return NilFloatValues
 }
 
 type MetricFloatValues interface {
@@ -180,7 +185,7 @@ func (m *Metric) GetTags() Tags {
 	if m != nil {
 		return m.Tags
 	}
-	return noopStringValues
+	return NilStringValues
 }
 
 func (m *Metric) GetType() EventType {
@@ -239,5 +244,60 @@ func (m *Metric) GetTypedValue() MetricTypedValues {
 	if m != nil && m.TypedValue != nil {
 		return m.TypedValue
 	}
-	return noopTypedValues
+	return NilTypedValues
+}
+
+func (m *Metric) Clone() PipelineEvent {
+	if m != nil {
+		return &Metric{
+			Name:              m.Name,
+			Description:       m.Description,
+			Timestamp:         m.Timestamp,
+			ObservedTimestamp: m.ObservedTimestamp,
+			Tags:              m.Tags,
+			MetricType:        m.MetricType,
+			Value:             m.Value,
+			TypedValue:        m.TypedValue,
+		}
+	}
+	return nil
+}
+
+func (m *Metric) String() string {
+	var builder strings.Builder
+	builder.WriteString(m.GetName())
+
+	tags := m.GetTags()
+
+	if tags.Len() > 0 {
+		builder.WriteByte('{')
+		sortedTags := tags.SortTo(nil)
+		for i, tags := range sortedTags {
+			builder.WriteString(fmt.Sprintf("%v=%v", tags.Key, tags.Value))
+			if i < len(sortedTags)-1 {
+				builder.WriteString(", ")
+			}
+		}
+		builder.WriteString("}")
+	}
+
+	builder.WriteString("[Type=")
+	builder.WriteString(MetricTypeTexts[m.MetricType])
+	builder.WriteString(", Ts=")
+	builder.WriteString(fmt.Sprintf("%v", m.Timestamp))
+	builder.WriteString("] ")
+
+	if m.Value.IsSingleValue() {
+		builder.WriteString(fmt.Sprintf("value=%v", m.Value.GetSingleValue()))
+	} else {
+		sortedValues := m.Value.GetMultiValues().SortTo(nil)
+		for i, values := range sortedValues {
+			builder.WriteString(fmt.Sprintf("%v=%v", values.Key, values))
+			if i < len(sortedValues)-1 {
+				builder.WriteString(", ")
+			}
+		}
+	}
+
+	return builder.String()
 }

@@ -89,6 +89,7 @@ type SpanLink struct {
 type SpanEvent struct {
 	Timestamp int64
 	Name      string
+	Tags      Tags
 }
 
 // A Span represents a single operation performed by a single component of the system.
@@ -127,7 +128,7 @@ func (m *Span) GetTags() Tags {
 	if m != nil {
 		return m.Tags
 	}
-	return noopStringValues
+	return NilStringValues
 }
 
 func (m *Span) GetType() EventType {
@@ -222,4 +223,25 @@ func (m *Span) GetEvents() []*SpanEvent {
 		return m.Events
 	}
 	return noopSpanEvents
+}
+
+func (m *Span) Clone() PipelineEvent {
+	if m != nil {
+		return &Span{
+			TraceID:           m.TraceID,
+			SpanID:            m.SpanID,
+			ParentSpanID:      m.ParentSpanID,
+			Name:              m.Name,
+			TraceState:        m.TraceState,
+			StartTime:         m.StartTime,
+			EndTime:           m.EndTime,
+			ObservedTimestamp: m.ObservedTimestamp,
+			Kind:              m.Kind,
+			Status:            m.Status,
+			Tags:              m.Tags,
+			Links:             m.Links,
+			Events:            m.Events,
+		}
+	}
+	return nil
 }

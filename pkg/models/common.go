@@ -14,6 +14,10 @@
 
 package models
 
+import (
+	"sort"
+)
+
 type EventType int
 
 const (
@@ -35,9 +39,10 @@ const (
 )
 
 var (
-	noopStringValues = &keyValuesNoop[string]{}
-	noopTypedValues  = &keyValuesNoop[*TypedValue]{}
-	noopFloatValues  = &keyValuesNoop[float64]{}
+	NilStringValues    = &keyValuesNil[string]{}
+	NilTypedValues     = &keyValuesNil[*TypedValue]{}
+	NilFloatValues     = &keyValuesNil[float64]{}
+	NilInterfaceValues = &keyValuesNil[interface{}]{}
 )
 
 type TypedValue struct {
@@ -45,7 +50,18 @@ type TypedValue struct {
 	Value interface{}
 }
 
-type KeyValues[TValue string | float64 | *TypedValue] interface {
+type KeyValue[TValue string | float64 | *TypedValue | any] struct {
+	Key   string
+	Value TValue
+}
+
+type KeyValueSlice[TValue string | float64 | *TypedValue | any] []KeyValue[TValue]
+
+func (x KeyValueSlice[TValue]) Len() int           { return len(x) }
+func (x KeyValueSlice[TValue]) Less(i, j int) bool { return x[i].Key < x[j].Key }
+func (x KeyValueSlice[TValue]) Swap(i, j int)      { x[i], x[j] = x[j], x[i] }
+
+type KeyValues[TValue string | float64 | *TypedValue | any] interface {
 	Add(key string, value TValue)
 
 	AddAll(items map[string]TValue)
@@ -60,18 +76,18 @@ type KeyValues[TValue string | float64 | *TypedValue] interface {
 
 	Iterator() map[string]TValue
 
+	SortTo(buf []KeyValue[TValue]) []KeyValue[TValue]
+
 	Len() int
+
+	IsNil() bool
 }
 
-type Tags interface {
-	KeyValues[string]
-}
+type Tags KeyValues[string]
 
-type Metadata interface {
-	KeyValues[string]
-}
+type Metadata KeyValues[string]
 
-type keyValuesImpl[TValue string | float64 | *TypedValue] struct {
+type keyValuesImpl[TValue string | float64 | *TypedValue | any] struct {
 	keyValues map[string]TValue
 }
 
@@ -140,34 +156,71 @@ func (kv *keyValuesImpl[TValue]) Len() int {
 	return 0
 }
 
-type keyValuesNoop[TValue string | float64 | *TypedValue] struct {
+func (kv *keyValuesImpl[TValue]) IsNil() bool {
+	return false
 }
 
-func (kv *keyValuesNoop[TValue]) Add(key string, value TValue) {
+func (kv *keyValuesImpl[TValue]) SortTo(buf []KeyValue[TValue]) []KeyValue[TValue] {
+	values, ok := kv.values()
+	if !ok {
+		buf = buf[:0]
+		return buf
+	}
+	if buf == nil {
+		buf = make([]KeyValue[TValue], 0, len(values))
+	} else {
+		buf = buf[:0]
+	}
+
+	for k, v := range values {
+		buf = append(buf, KeyValue[TValue]{Key: k, Value: v})
+	}
+	sort.Sort(KeyValueSlice[TValue](buf))
+	return buf
 }
 
-func (kv *keyValuesNoop[TValue]) AddAll(items map[string]TValue) {
+type keyValuesNil[TValue string | float64 | *TypedValue | any] struct {
 }
 
-func (kv *keyValuesNoop[TValue]) Get(key string) TValue {
+func (kv *keyValuesNil[TValue]) Add(key string, value TValue) {
+}
+
+func (kv *keyValuesNil[TValue]) AddAll(items map[string]TValue) {
+}
+
+func (kv *keyValuesNil[TValue]) Get(key string) TValue {
 	var null TValue
 	return null
 }
 
-func (kv *keyValuesNoop[TValue]) Contains(key string) bool {
+func (kv *keyValuesNil[TValue]) Contains(key string) bool {
 	return false
 }
 
-func (kv *keyValuesNoop[TValue]) Delete(key string) {
+func (kv *keyValuesNil[TValue]) Delete(key string) {
 }
 
-func (kv *keyValuesNoop[TValue]) Merge(other KeyValues[TValue]) {
+func (kv *keyValuesNil[TValue]) Merge(other KeyValues[TValue]) {
 }
 
-func (kv *keyValuesNoop[TValue]) Iterator() map[string]TValue {
+func (kv *keyValuesNil[TValue]) Iterator() map[string]TValue {
 	return make(map[string]TValue)
 }
 
-func (kv *keyValuesNoop[TValue]) Len() int {
+func (kv *keyValuesNil[TValue]) Len() int {
 	return 0
+}
+
+func (kv *keyValuesNil[TValue]) IsNil() bool {
+	return true
+}
+
+func (kv *keyValuesNil[TValue]) SortTo(buf []KeyValue[TValue]) []KeyValue[TValue] {
+	return nil
+}
+
+func NewKeyValues[TValue string | float64 | *TypedValue | any]() KeyValues[TValue] {
+	return &keyValuesImpl[TValue]{
+		keyValues: make(map[string]TValue),
+	}
 }

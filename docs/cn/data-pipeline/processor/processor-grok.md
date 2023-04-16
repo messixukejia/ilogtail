@@ -4,11 +4,15 @@
 
 `processor_grok`插件可以通过 Grok 语法匹配的模式，实现文本日志的字段提取。[源代码](https://github.com/alibaba/ilogtail/tree/main/plugins/processor/processor_grok.go)
 
+## 版本
+
+[Beta](../stability-level.md)
+
 ## 配置参数
 
 | 参数 | 类型，默认值 | 说明 |
 | - | - | - |
-| Type                | String，无默认值（必填)                 | 插件类型，固定为`processor_grok` |
+| Type                | String，无默认值（必填）                 | 插件类型，固定为`processor_grok` |
 | CustomPatternDir    | Array，其中 value 为 String，`[]`      | 自定义的GROK模式所在的文件夹地址，会读取文件夹内的所有文件。需要重启生效。 |
 | CustomPatterns      | Map，其中 key 和 value 为 String，`{}` | 自定义的GROK模式，key 为规则名，value 为 grok 表达式。 |
 | SourceKey           | String，`content`                     | 需要匹配的目标字段。    |
@@ -17,8 +21,8 @@
 | IgnoreParseFailure  | Boolean，`true`                       | 指定解析失败后的操作，不配置表示放弃解析，直接填充所返回的 content 字段。配置为 false ，表示解析失败时丢弃日志。 |
 | KeepSource          | Boolean，`true`                       | 是否保留原字段。     |
 | NoKeyError          | Boolean，`false`                      | 无匹配的原始字段时是否报错。     |
-| NoMatchError        | Boolean，`false`                      | Match 中的表达式全不匹配时是否报错。     |
-| TimeoutError        | Boolean，`false`                      | 匹配超时是否返回错误。      |
+| NoMatchError        | Boolean，`true`                      | Match 中的表达式全不匹配时是否报错。     |
+| TimeoutError        | Boolean，`true`                      | 匹配超时是否返回错误。      |
 
 ## 样例
 

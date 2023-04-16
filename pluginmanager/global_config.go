@@ -17,6 +17,7 @@ package pluginmanager
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"sync"
 
@@ -64,6 +65,7 @@ func LoadGlobalConfig(jsonStr string) int {
 					util.SetNetworkIdentification(LogtailGlobalConfig.HostIP, LogtailGlobalConfig.Hostname)
 				}
 			}
+			UserAgent = fmt.Sprintf("ilogtail/%v (%v) ip/%v", BaseVersion, runtime.GOOS, LogtailGlobalConfig.HostIP)
 		}
 	})
 	return rst
@@ -76,12 +78,8 @@ func newGlobalConfig() (cfg GlobalConfig) {
 		FlushIntervalMs:          3000,
 		DefaultLogQueueSize:      1000,
 		DefaultLogGroupQueueSize: 4,
+		LogtailSysConfDir:        ".",
 		DelayStopSec:             300,
-	}
-	if runtime.GOOS == "windows" {
-		cfg.LogtailSysConfDir = "C:\\LogtailData"
-	} else {
-		cfg.LogtailSysConfDir = "/etc/ilogtail"
 	}
 	return
 }

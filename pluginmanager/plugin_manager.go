@@ -15,16 +15,17 @@
 package pluginmanager
 
 import (
-	"github.com/alibaba/ilogtail/helper"
-	"github.com/alibaba/ilogtail/pkg/logger"
-	"github.com/alibaba/ilogtail/pkg/pipeline"
-	"github.com/alibaba/ilogtail/plugin_main/flags"
-
 	"context"
+	"fmt"
 	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/alibaba/ilogtail/pkg/helper"
+	"github.com/alibaba/ilogtail/pkg/logger"
+	"github.com/alibaba/ilogtail/pkg/pipeline"
+	"github.com/alibaba/ilogtail/plugin_main/flags"
 )
 
 // Following variables are exported so that tests of main package can reference them.
@@ -41,7 +42,8 @@ var DisabledLogtailConfigLock sync.Mutex
 var DisabledLogtailConfig = make(map[string]*LogstoreConfig)
 
 // StatisticsConfigJson, AlarmConfigJson
-var BaseVersion = "0.1.0"
+var BaseVersion = "0.1.0"                                                  // will be overwritten through ldflags at compile time
+var UserAgent = fmt.Sprintf("ilogtail/%v (%v)", BaseVersion, runtime.GOOS) // set in global config
 
 var statisticsConfigJSON = `{
     "global": {
@@ -51,8 +53,8 @@ var statisticsConfigJSON = `{
         "DefaultLogQueueSize": 4,
 		"DefaultLogGroupQueueSize": 4,
 		"Tags" : {
-			"base_version" : "0.1.0",
-			"logtail_version" : "0.16.19"
+			"base_version" : "` + BaseVersion + `",
+			"logtail_version" : "` + BaseVersion + `"
 		}
 	},
 	"inputs" : [
@@ -71,8 +73,8 @@ var alarmConfigJSON = `{
         "DefaultLogQueueSize": 4,
 		"DefaultLogGroupQueueSize": 4,
 		"Tags" : {
-			"base_version" : "0.1.0",
-			"logtail_version" : "0.16.19"
+			"base_version" : "` + BaseVersion + `",
+			"logtail_version" : "` + BaseVersion + `"
 		}
     },
 	"inputs" : [
@@ -91,8 +93,8 @@ var containerConfigJSON = `{
         "DefaultLogQueueSize": 4,
 		"DefaultLogGroupQueueSize": 4,
 		"Tags" : {
-			"base_version" : "0.1.0",
-			"logtail_version" : "0.16.19"
+			"base_version" : "` + BaseVersion + `",
+			"logtail_version" : "` + BaseVersion + `"
 		}
     },
 	"inputs" : [

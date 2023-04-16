@@ -16,8 +16,10 @@ package http
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
@@ -25,10 +27,11 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/alibaba/ilogtail/helper"
+	"github.com/alibaba/ilogtail/pkg/helper"
 	"github.com/alibaba/ilogtail/pkg/logger"
 	"github.com/alibaba/ilogtail/pkg/models"
 	"github.com/alibaba/ilogtail/pkg/pipeline"
+	"github.com/alibaba/ilogtail/pkg/pipeline/extensions"
 	"github.com/alibaba/ilogtail/pkg/protocol"
 	converter "github.com/alibaba/ilogtail/pkg/protocol/converter"
 	"github.com/alibaba/ilogtail/plugins/test/mock"
@@ -83,7 +86,52 @@ func TestHttpFlusherInit(t *testing.T) {
 		Convey("Then Init() should build the variable keys", func() {
 			err := flusher.Init(mockContext{})
 			So(err, ShouldBeNil)
-			So(flusher.queryVarKeys, ShouldResemble, []string{"var"})
+			So(flusher.varKeys, ShouldResemble, []string{"var"})
+		})
+	})
+
+	Convey("Given a http flusher with Headers contains variable ", t, func() {
+		flusher := &FlusherHTTP{
+			RemoteURL: "http://localhost:8086/write",
+			Convert: helper.ConvertConfig{
+				Protocol: converter.ProtocolCustomSingle,
+				Encoding: converter.EncodingJSON,
+			},
+			Timeout:     defaultTimeout,
+			Concurrency: 1,
+			Headers: map[string]string{
+				"name": "_%{var}",
+			},
+		}
+		Convey("Then Init() should build the variable keys", func() {
+			err := flusher.Init(mockContext{})
+			So(err, ShouldBeNil)
+			So(flusher.varKeys, ShouldResemble, []string{"var"})
+		})
+	})
+
+	Convey("Given a http flusher with Query AND Headers contains variable ", t, func() {
+		flusher := &FlusherHTTP{
+			RemoteURL: "http://localhost:8086/write",
+			Convert: helper.ConvertConfig{
+				Protocol: converter.ProtocolCustomSingle,
+				Encoding: converter.EncodingJSON,
+			},
+			Timeout:     defaultTimeout,
+			Concurrency: 1,
+			Query: map[string]string{
+				"name": "_%{var1}",
+			},
+			Headers: map[string]string{
+				"name": "_%{var2}",
+				"tt":   "_%{var1}",
+			},
+		}
+		Convey("Then Init() should build the variable keys", func() {
+			err := flusher.Init(mockContext{})
+			sort.Strings(flusher.varKeys)
+			So(err, ShouldBeNil)
+			So(flusher.varKeys, ShouldResemble, []string{"var1", "var2"})
 		})
 	})
 }
@@ -96,6 +144,7 @@ func TestHttpFlusherFlush(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		httpmock.RegisterResponder("POST", "http://test.com/write?db=mydb", func(req *http.Request) (*http.Response, error) {
+			assert.Equal(t, "mydb", req.Header.Get("db"))
 			body, _ := ioutil.ReadAll(req.Body)
 			actualRequests = append(actualRequests, string(body))
 			return httpmock.NewStringResponse(200, "ok"), nil
@@ -110,6 +159,9 @@ func TestHttpFlusherFlush(t *testing.T) {
 			Timeout:     defaultTimeout,
 			Concurrency: 1,
 			Query: map[string]string{
+				"db": "%{tag.db}",
+			},
+			Headers: map[string]string{
 				"db": "%{tag.db}",
 			},
 		}
@@ -282,6 +334,113 @@ func TestHttpFlusherFlush(t *testing.T) {
 						`{"contents":{"__labels__":"location#$#hangzhou|province#$#zhejiang","__name__":"weather","__time_nano__":"1668653452000000001","__value__":"32"},"tags":{"db":"mydb","host.ip":""},"time":0}`,
 						`{"contents":{"__labels__":"location#$#hangzhou|province#$#zhejiang","__name__":"weather","__time_nano__":"1668653452000000003","__value__":"30"},"tags":{"db":"mydb","host.ip":""},"time":0}`,
 						`{"contents":{"__labels__":"location#$#hangzhou|province#$#zhejiang","__name__":"weather","__time_nano__":"1668653452000000004","__value__":"32"},"tags":{"db":"mydb","host.ip":""},"time":0}`,
+					})
+				})
+			})
+		})
+	})
+}
+
+func TestHttpFlusherFlushWithAuthenticator(t *testing.T) {
+	Convey("Given a http flusher with protocol: Influxdb, encoding: custom,with basicauth authenticator, query: contains variable '%{tag.db}'", t, func() {
+
+		var actualRequests []string
+		httpmock.Activate()
+		defer httpmock.DeactivateAndReset()
+
+		httpmock.RegisterResponder("POST", "http://test.com/write?db=mydb", func(req *http.Request) (*http.Response, error) {
+			assert.Equal(t, req.Header.Get("Authorization"), "Basic dXNlcjE6cHdkMQ==")
+			body, _ := ioutil.ReadAll(req.Body)
+			actualRequests = append(actualRequests, string(body))
+			return httpmock.NewStringResponse(200, "ok"), nil
+		})
+
+		authenticator := &basicAuth{Username: "user1", Password: "pwd1"}
+
+		flusher := &FlusherHTTP{
+			RemoteURL: "http://test.com/write",
+			Convert: helper.ConvertConfig{
+				Protocol: converter.ProtocolInfluxdb,
+				Encoding: converter.EncodingCustom,
+			},
+			Timeout:     defaultTimeout,
+			Concurrency: 1,
+			Query: map[string]string{
+				"db": "%{tag.db}",
+			},
+			Authenticator: &extensions.ExtensionConfig{
+				Type: "ext_basicauth",
+			},
+		}
+
+		err := flusher.Init(mockContext{basicAuth: authenticator})
+		So(err, ShouldBeNil)
+
+		Convey("When Flush with logGroupList contains 2 valid Log in influxdb format metrics, each with LogTag: '__tag__:db'", func() {
+			logGroups := []*protocol.LogGroup{
+				{
+					Logs: []*protocol.Log{
+						{
+							Contents: []*protocol.Log_Content{
+								{Key: "__time_nano__", Value: "1668653452000000000"},
+								{Key: "__name__", Value: "weather"},
+								{Key: "__labels__", Value: "location#$#hangzhou|province#$#zhejiang"},
+								{Key: "__value__", Value: "30"},
+							},
+						},
+						{
+							Contents: []*protocol.Log_Content{
+								{Key: "__time_nano__", Value: "1668653452000000001"},
+								{Key: "__name__", Value: "weather"},
+								{Key: "__labels__", Value: "location#$#hangzhou|province#$#zhejiang"},
+								{Key: "__value__", Value: "32"},
+							},
+						},
+					},
+					LogTags: []*protocol.LogTag{{Key: "__tag__:db", Value: "mydb"}},
+				},
+				{
+					Logs: []*protocol.Log{
+						{
+							Contents: []*protocol.Log_Content{
+								{Key: "__time_nano__", Value: "1668653452000000003"},
+								{Key: "__name__", Value: "weather"},
+								{Key: "__labels__", Value: "location#$#hangzhou|province#$#zhejiang"},
+								{Key: "__value__", Value: "30"},
+							},
+						},
+						{
+							Contents: []*protocol.Log_Content{
+								{Key: "__time_nano__", Value: "1668653452000000004"},
+								{Key: "__name__", Value: "weather"},
+								{Key: "__labels__", Value: "location#$#hangzhou|province#$#zhejiang"},
+								{Key: "__value__", Value: "32"},
+							},
+						},
+					},
+					LogTags: []*protocol.LogTag{{Key: "__tag__:db", Value: "mydb"}},
+				},
+			}
+
+			err := flusher.Flush("", "", "", logGroups)
+			flusher.Stop()
+			Convey("Then", func() {
+				Convey("Flush() should not return error", func() {
+					So(err, ShouldBeNil)
+				})
+
+				Convey("each logGroup should be sent as one single request", func() {
+					reqCount := httpmock.GetTotalCallCount()
+					So(reqCount, ShouldEqual, 2)
+				})
+
+				Convey("each http request body should be valid as expect", func() {
+					So(actualRequests, ShouldResemble, []string{
+						"weather,location=hangzhou,province=zhejiang value=30 1668653452000000000\n" +
+							"weather,location=hangzhou,province=zhejiang value=32 1668653452000000001\n",
+
+						"weather,location=hangzhou,province=zhejiang value=30 1668653452000000003\n" +
+							"weather,location=hangzhou,province=zhejiang value=32 1668653452000000004\n",
 					})
 				})
 			})
@@ -523,6 +682,14 @@ func TestGetNextRetryDelay(t *testing.T) {
 
 type mockContext struct {
 	pipeline.Context
+	basicAuth *basicAuth
+}
+
+func (c mockContext) GetExtension(name string, cfg any) (pipeline.Extension, error) {
+	if c.basicAuth == nil {
+		return nil, fmt.Errorf("basicAuth not set")
+	}
+	return c.basicAuth, nil
 }
 
 func (c mockContext) GetConfigName() string {
@@ -535,4 +702,35 @@ func (c mockContext) GetRuntimeContext() context.Context {
 
 func init() {
 	logger.InitTestLogger(logger.OptionOpenMemoryReceiver)
+}
+
+type basicAuth struct {
+	Username string
+	Password string
+}
+
+func (b *basicAuth) Description() string {
+	return "basic auth extension to add auth info to client request"
+}
+
+func (b *basicAuth) Init(context pipeline.Context) error {
+	return nil
+}
+
+func (b *basicAuth) Stop() error {
+	return nil
+}
+
+func (b *basicAuth) RoundTripper(base http.RoundTripper) (http.RoundTripper, error) {
+	return &basicAuthRoundTripper{base: base, auth: b}, nil
+}
+
+type basicAuthRoundTripper struct {
+	base http.RoundTripper
+	auth *basicAuth
+}
+
+func (b *basicAuthRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	request.SetBasicAuth(b.auth.Username, b.auth.Password)
+	return b.base.RoundTrip(request)
 }

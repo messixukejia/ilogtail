@@ -22,7 +22,7 @@ option(ENABLE_STATIC_LINK_CRT "Build Logtail by linking CRT statically" OFF)
 
 # Name/Version information.
 if (NOT DEFINED LOGTAIL_VERSION)
-    set(LOGTAIL_VERSION "1.3.1")
+    set(LOGTAIL_VERSION "1.4.0")
 endif ()
 message(STATUS "Version: ${LOGTAIL_VERSION}")
 
@@ -62,6 +62,7 @@ elseif (MSVC)
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /DEBUG /OPT:REF /OPT:ICF")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd /MP")
 endif ()
+cmake_policy(SET CMP0074 NEW)
 
 # To be compatible with low version Linux (-DENABLE_COMPATIBLE_MODE=ON).
 if (ENABLE_COMPATIBLE_MODE)
@@ -79,7 +80,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/dependencies.cmake)
 
 # Subdirectories (modules).
 set(SUB_DIRECTORIES_LIST
-        aggregator app_config checkpoint common config config_manager
+        aggregator app_config checkpoint common config config_manager config_server_pb
         controller event event_handler event_listener helper log_pb logger monitor
         parser plugin polling processor profiler reader profile_sender sender shennong sdk
         fuse sls_control

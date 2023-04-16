@@ -16,6 +16,7 @@ package httpserver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,10 +25,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/alibaba/ilogtail/helper/decoder"
+	"github.com/alibaba/ilogtail/pkg/helper"
 	"github.com/alibaba/ilogtail/pkg/logger"
 	"github.com/alibaba/ilogtail/pkg/models"
 	"github.com/alibaba/ilogtail/pkg/pipeline"
+	"github.com/alibaba/ilogtail/pkg/pipeline/extensions"
+	"github.com/alibaba/ilogtail/pkg/protocol/decoder/common"
 )
 
 const (
@@ -35,26 +38,34 @@ const (
 	v2
 )
 
+const name = "service_http_server"
+
 // ServiceHTTP ...
 type ServiceHTTP struct {
 	context     pipeline.Context
 	collector   pipeline.Collector
-	decoder     decoder.Decoder
+	decoder     extensions.Decoder
 	server      *http.Server
 	listener    net.Listener
 	wg          sync.WaitGroup
 	collectorV2 pipeline.PipelineCollector
 	version     int8
 	paramCount  int
+	dumper      *helper.Dumper
 
+	DumpDataKeepFiles  int
+	DumpData           bool   // would dump the received data to a local file, which is only used to valid data by the developers.
+	Decoder            string // the decoder to use, default is "ext_default_decoder"
 	Format             string
 	Address            string
+	Path               string
 	ReadTimeoutSec     int
 	ShutdownTimeoutSec int
 	MaxBodySize        int64
 	UnlinkUnixSock     bool
 	FieldsExtend       bool
 	DisableUncompress  bool
+	Tags               map[string]string // todo for v2
 
 	// params below works only for version v2
 	QueryParams       []string
@@ -67,16 +78,47 @@ type ServiceHTTP struct {
 func (s *ServiceHTTP) Init(context pipeline.Context) (int, error) {
 	s.context = context
 	var err error
-	if s.decoder, err = decoder.GetDecoderWithOptions(s.Format, decoder.Option{FieldsExtend: s.FieldsExtend, DisableUncompress: s.DisableUncompress}); err != nil {
+
+	options := &struct {
+		Format            string
+		FieldsExtend      bool
+		DisableUncompress bool
+	}{
+		Format:            s.Format,
+		FieldsExtend:      s.FieldsExtend,
+		DisableUncompress: s.DisableUncompress,
+	}
+	ext, err := context.GetExtension(s.Decoder, options)
+	if err != nil {
 		return 0, err
 	}
-
-	if s.Format == "otlp_logv1" {
-		s.Address += "/v1/logs"
+	decoder, ok := ext.(extensions.Decoder)
+	if !ok {
+		return 0, fmt.Errorf("extension %s with type %T not implement extensions.Decoder", s.Decoder, ext)
 	}
+	s.decoder = decoder
+
+	if s.Path == "" {
+		switch s.Format {
+		case common.ProtocolOTLPLogV1:
+			s.Path = "/v1/logs"
+		case common.ProtocolOTLPMetricV1:
+			s.Path = "/v1/metrics"
+		case common.ProtocolOTLPTraceV1:
+			s.Path = "/v1/traces"
+		case common.ProtocolPyroscope:
+			s.Path = "/ingest"
+		}
+	}
+	s.Address += s.Path
+	logger.Infof(context.GetRuntimeContext(), "addr", s.Address, "format", s.Format)
 
 	s.paramCount = len(s.QueryParams) + len(s.HeaderParams)
 
+	if s.DumpData {
+		s.dumper = helper.NewDumper(strings.Join([]string{name, context.GetProject(), context.GetConfigName()}, "-"), s.DumpDataKeepFiles)
+		s.dumper.Init()
+	}
 	return 0, nil
 }
 
@@ -93,34 +135,41 @@ func (s *ServiceHTTP) Collect(pipeline.Collector) error {
 
 func (s *ServiceHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > s.MaxBodySize {
-		tooLarge(w)
+		TooLarge(w)
 		return
 	}
 	data, statusCode, err := s.decoder.ParseRequest(w, r, s.MaxBodySize)
-	logger.Debugf(s.context.GetRuntimeContext(), "request [method] %v; [header] %v; [url] %v; [body] %v", r.Method, r.Header, r.URL, string(data))
-
+	logger.Debugf(s.context.GetRuntimeContext(), "request [method] %v; [header] %v; [url] %v; [body len] %d", r.Method, r.Header, r.URL, len(data))
 	switch statusCode {
 	case http.StatusBadRequest:
-		badRequest(w)
+		BadRequest(w)
 	case http.StatusRequestEntityTooLarge:
-		tooLarge(w)
+		TooLarge(w)
 	case http.StatusInternalServerError:
-		internalServerError(w)
+		InternalServerError(w)
 	case http.StatusMethodNotAllowed:
-		methodNotAllowed(w)
-
+		MethodNotAllowed(w)
 	}
 	if err != nil {
 		logger.Warning(s.context.GetRuntimeContext(), "READ_BODY_FAIL_ALARM", "read body failed", err, "request", r.URL.String())
 		return
 	}
 
+	if s.dumper != nil {
+		s.dumper.InputChannel() <- &helper.DumpData{
+			Req: helper.DumpDataReq{
+				Body:   data,
+				URL:    r.URL.String(),
+				Header: r.Header,
+			},
+		}
+	}
 	switch s.version {
 	case v1:
-		logs, err := s.decoder.Decode(data, r)
+		logs, err := s.decoder.Decode(data, r, s.Tags)
 		if err != nil {
 			logger.Warning(s.context.GetRuntimeContext(), "DECODE_BODY_FAIL_ALARM", "decode body failed", err, "request", r.URL.String())
-			badRequest(w)
+			BadRequest(w)
 			return
 		}
 		for _, log := range logs {
@@ -130,7 +179,7 @@ func (s *ServiceHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		groups, err := s.decoder.DecodeV2(data, r)
 		if err != nil {
 			logger.Warning(s.context.GetRuntimeContext(), "DECODE_BODY_FAIL_ALARM", "decode body failed", err, "request", r.URL.String())
-			badRequest(w)
+			BadRequest(w)
 			return
 		}
 		if reqParams := s.extractRequestParams(r); len(reqParams) != 0 {
@@ -141,33 +190,35 @@ func (s *ServiceHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.collectorV2.CollectList(groups...)
 	}
 
-	if s.Format == "sls" {
+	switch s.Format {
+	case common.ProtocolSLS:
 		w.Header().Set("x-log-requestid", "1234567890abcde")
 		w.WriteHeader(http.StatusOK)
-	} else {
+	case common.ProtocolPyroscope:
+		// do nothing
+	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
-
 }
 
-func tooLarge(res http.ResponseWriter) {
+func TooLarge(res http.ResponseWriter) {
 	res.Header().Set("Content-Type", "application/json")
 	res.WriteHeader(http.StatusRequestEntityTooLarge)
 	_, _ = res.Write([]byte(`{"error":"http: request body too large"}`))
 }
 
-func methodNotAllowed(res http.ResponseWriter) {
+func MethodNotAllowed(res http.ResponseWriter) {
 	res.Header().Set("Content-Type", "application/json")
 	res.WriteHeader(http.StatusMethodNotAllowed)
 	_, _ = res.Write([]byte(`{"error":"http: method not allowed"}`))
 }
 
-func internalServerError(res http.ResponseWriter) {
+func InternalServerError(res http.ResponseWriter) {
 	res.Header().Set("Content-Type", "application/json")
 	res.WriteHeader(http.StatusInternalServerError)
 }
 
-func badRequest(res http.ResponseWriter) {
+func BadRequest(res http.ResponseWriter) {
 	res.Header().Set("Content-Type", "application/json")
 	res.WriteHeader(http.StatusBadRequest)
 	_, _ = res.Write([]byte(`{"error":"http: bad request"}`))
@@ -184,7 +235,6 @@ func (s *ServiceHTTP) Start(c pipeline.Collector) error {
 func (s *ServiceHTTP) StartService(context pipeline.PipelineContext) error {
 	s.collectorV2 = context.Collector()
 	s.version = v2
-
 	return s.start()
 }
 
@@ -230,6 +280,9 @@ func (s *ServiceHTTP) start() error {
 		logger.Info(s.context.GetRuntimeContext(), "http server shutdown", s.Address)
 		s.wg.Done()
 	}()
+	if s.dumper != nil {
+		s.dumper.Start()
+	}
 	return nil
 }
 
@@ -271,16 +324,22 @@ func (s *ServiceHTTP) Stop() error {
 		logger.Info(s.context.GetRuntimeContext(), "http server stop", s.Address)
 		s.wg.Wait()
 	}
+	if s.dumper != nil {
+		s.dumper.Close()
+	}
 	return nil
 }
 
 func init() {
-	pipeline.ServiceInputs["service_http_server"] = func() pipeline.ServiceInput {
+	pipeline.ServiceInputs[name] = func() pipeline.ServiceInput {
 		return &ServiceHTTP{
+			Decoder:            "ext_default_decoder",
 			ReadTimeoutSec:     10,
 			ShutdownTimeoutSec: 5,
 			MaxBodySize:        64 * 1024 * 1024,
 			UnlinkUnixSock:     true,
+			DumpDataKeepFiles:  5,
+			Tags:               map[string]string{},
 		}
 	}
 }
